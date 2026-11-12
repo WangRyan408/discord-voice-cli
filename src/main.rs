@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use serenity::all::{ChannelId, Client, Context, EventHandler, GatewayIntents, GuildId, Ready};
+use serenity::all::{Client, Context, EventHandler, GatewayIntents, Ready};
 use serenity::async_trait;
-use songbird::{Config, CoreEvent, SerenityInit, Songbird, driver::DecodeMode};
+use songbird::{Call, SerenityInit, Songbird};
 use tokio::sync::{Notify, oneshot};
 
 mod args;
@@ -36,9 +36,8 @@ fn main() -> Result<(), Error> {
 #[tokio::main]
 async fn run(args: args::Args) -> Result<(), Error> {
     let ready = Arc::new(Notify::new());
-    let manager = Songbird::serenity_from_config(
-        Config::default().decode_mode(DecodeMode::Decode(Default::default())),
-    );
+    let manager =
+        Songbird::serenity_from_config(audio::voice_config(args.audio_mode, args.self_deafen));
     // The patched user-account gateway omits bot-only intents from IDENTIFY.
     let intents = GatewayIntents::empty();
     let mut client = Client::builder(&args.token, intents)
@@ -53,7 +52,7 @@ async fn run(args: args::Args) -> Result<(), Error> {
     let session = async {
         let connect = async {
             ready.notified().await;
-            connect_voice(&manager, args.guild_id, args.channel_id).await
+            connect_voice(&manager, &args).await
         };
         let _audio_streams = tokio::select! {
             result = connect => result?,
@@ -83,21 +82,34 @@ async fn run(args: args::Args) -> Result<(), Error> {
     Ok(())
 }
 
-async fn connect_voice(
-    manager: &Songbird,
-    guild_id: GuildId,
-    channel_id: ChannelId,
-) -> Result<(cpal::Stream, cpal::Stream), Error> {
-    let (input, microphone_stream) = sender::Sender::capture()?;
-    let (receiver, playback_stream) = receiver::Receiver::playback()?;
-    let call = manager.join(guild_id, channel_id).await?;
+async fn connect_voice(manager: &Songbird, args: &args::Args) -> Result<audio::Streams, Error> {
+    let audio = audio::Session::open(args.audio_mode, args.self_mute, args.self_deafen)?;
+    let call = manager.get_or_insert(args.guild_id);
     {
         let mut call = call.lock().await;
-        call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
-        call.play_only_input(input);
+        configure_voice_state(&mut call, args.self_mute, args.self_deafen).await?;
     }
-    println!("Voice connected. Press Enter or Ctrl+C to disconnect.");
-    Ok((microphone_stream, playback_stream))
+    // Apply the flags before joining so the first channel join has the requested state.
+    let call = manager.join(args.guild_id, args.channel_id).await?;
+    let streams = {
+        let mut call = call.lock().await;
+        audio.attach(&mut call)
+    };
+    println!(
+        "Voice connected (audio: {:?}, self-mute: {}, self-deafen: {}). Press Enter or Ctrl+C to disconnect.",
+        args.audio_mode, args.self_mute, args.self_deafen,
+    );
+    Ok(streams)
+}
+
+async fn configure_voice_state(
+    call: &mut Call,
+    self_mute: bool,
+    self_deafen: bool,
+) -> Result<(), Error> {
+    call.mute(self_mute).await?;
+    call.deafen(self_deafen).await?;
+    Ok(())
 }
 
 async fn wait_for_exit() -> Result<(), Error> {
@@ -108,8 +120,114 @@ async fn wait_for_exit() -> Result<(), Error> {
         let _ = sender.send(result);
     });
     tokio::select! {
-        result = receiver => { result??; },
+        result = wait_for_stdin(receiver) => result?,
         result = tokio::signal::ctrl_c() => result?,
     }
     Ok(())
+}
+
+async fn wait_for_stdin(receiver: oneshot::Receiver<std::io::Result<usize>>) -> Result<(), Error> {
+    match receiver.await?? {
+        // Services and containers often have stdin connected to /dev/null.
+        // EOF is not a shutdown request; keep waiting for Ctrl+C instead.
+        0 => std::future::pending().await,
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serenity::all::{ChannelId, GuildId, UserId};
+    use songbird::{
+        error::JoinResult,
+        shards::{Shard, VoiceUpdate},
+    };
+    use std::{
+        future::Future,
+        sync::Mutex,
+        task::{Context, Waker},
+    };
+
+    #[derive(Debug, PartialEq)]
+    struct VoiceState {
+        guild_id: songbird::id::GuildId,
+        channel_id: Option<songbird::id::ChannelId>,
+        self_deaf: bool,
+        self_mute: bool,
+    }
+
+    #[derive(Default)]
+    struct VoiceUpdates(Mutex<Vec<VoiceState>>);
+
+    #[async_trait]
+    impl VoiceUpdate for VoiceUpdates {
+        async fn update_voice_state(
+            &self,
+            guild_id: songbird::id::GuildId,
+            channel_id: Option<songbird::id::ChannelId>,
+            self_deaf: bool,
+            self_mute: bool,
+        ) -> JoinResult<()> {
+            self.0.lock().unwrap().push(VoiceState {
+                guild_id,
+                channel_id,
+                self_deaf,
+                self_mute,
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn first_channel_join_uses_requested_mute_and_deafen_flags() {
+        for self_mute in [false, true] {
+            for self_deafen in [false, true] {
+                let updates = Arc::new(VoiceUpdates::default());
+                let guild = GuildId::new(123);
+                let channel = ChannelId::new(456);
+                let mut call = Call::new(guild, Shard::Generic(updates.clone()), UserId::new(789));
+                configure_voice_state(&mut call, self_mute, self_deafen)
+                    .await
+                    .unwrap();
+                let _join = call.join(channel).await.unwrap();
+                let updates = updates.0.lock().unwrap();
+                let joined: Vec<_> = updates
+                    .iter()
+                    .filter(|update| update.channel_id.is_some())
+                    .collect();
+                assert_eq!(joined.len(), 1);
+                assert_eq!(
+                    *joined[0],
+                    VoiceState {
+                        guild_id: guild.into(),
+                        channel_id: Some(channel.into()),
+                        self_deaf: self_deafen,
+                        self_mute
+                    }
+                );
+                assert_eq!(call.is_mute(), self_mute);
+                assert_eq!(call.is_deaf(), self_deafen);
+            }
+        }
+    }
+
+    #[test]
+    fn closed_stdin_keeps_the_service_running() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(Ok(0)).unwrap();
+        let mut wait = Box::pin(wait_for_stdin(receiver));
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_still_requests_shutdown() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(Ok(1)).unwrap();
+        wait_for_stdin(receiver).await.unwrap();
+    }
 }
