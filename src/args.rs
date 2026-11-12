@@ -1,48 +1,87 @@
-use clap::{App, Arg};
-use serenity::model::prelude::*;
+use clap::Parser;
+use serenity::model::id::{ChannelId, GuildId};
 
+#[derive(Parser)]
+#[command(
+    name = "discord-voice-cli",
+    author,
+    version,
+    about = "A headless client for Discord voice chat"
+)]
 pub struct Args {
-    pub token: Option<String>,
-    pub guild_id: Option<GuildId>,
-    pub channel_id: Option<ChannelId>,
+    /// Discord user token (without a Bot or Bearer prefix)
+    #[arg(long, env = "DISCORD_TOKEN", hide_env_values = true)]
+    pub token: String,
+
+    /// ID of the guild to connect to
+    #[arg(long = "guild_id", visible_alias = "guild-id", env = "DISCORD_GUILD")]
+    pub guild_id: GuildId,
+
+    /// ID of the voice channel to connect to
+    #[arg(
+        long = "channel_id",
+        visible_alias = "channel-id",
+        env = "DISCORD_CHANNEL"
+    )]
+    pub channel_id: ChannelId,
 }
 
 pub fn get_args() -> Args {
-    let matches = App::new("Terminal Image Viewer")
-        .author("Noskcaj")
-        .about("Shows images in your terminal")
-        .arg(
-            Arg::with_name("token")
-                .long("token")
-                .env("DISCORD_TOKEN")
-                .help("Discord token to use, can also be set from DISCORD_TOKEN env var"),
-        ).arg(
-            Arg::with_name("guild_id")
-                .long("guild_id")
-                .takes_value(true)
-                .help("ID of Guild to connect to"),
-        ).arg(
-            Arg::with_name("channel_id")
-                .long("channel_id")
-                .takes_value(true)
-                .help("ID of channel to connect to"),
-        ).get_matches();
+    Args::parse()
+}
 
-    let token = matches.value_of("token").map(|tok| tok.to_owned());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let guild_id = matches
-        .value_of("guild_id")
-        .and_then(|id| id.parse().ok())
-        .map(GuildId);
+    #[test]
+    fn accepts_existing_flags() {
+        let args = Args::try_parse_from([
+            "discord-voice-cli",
+            "--token",
+            "test-token",
+            "--guild_id",
+            "123",
+            "--channel_id",
+            "456",
+        ])
+        .unwrap();
+        assert_eq!(args.token, "test-token");
+        assert_eq!(args.guild_id.get(), 123);
+        assert_eq!(args.channel_id.get(), 456);
+    }
 
-    let channel_id = matches
-        .value_of("channel_id")
-        .and_then(|id| id.parse().ok())
-        .map(ChannelId);
+    #[test]
+    fn accepts_hyphenated_aliases() {
+        let args = Args::try_parse_from([
+            "discord-voice-cli",
+            "--token",
+            "test-token",
+            "--guild-id",
+            "123",
+            "--channel-id",
+            "456",
+        ])
+        .unwrap();
+        assert_eq!(args.guild_id.get(), 123);
+        assert_eq!(args.channel_id.get(), 456);
+    }
 
-    Args {
-        token,
-        guild_id: guild_id,
-        channel_id: channel_id,
+    #[test]
+    fn rejects_invalid_ids() {
+        for id in ["0", "invalid", "-1", "18446744073709551616"] {
+            assert!(
+                Args::try_parse_from([
+                    "discord-voice-cli",
+                    "--token",
+                    "test-token",
+                    "--guild_id",
+                    id,
+                    "--channel_id",
+                    "456",
+                ])
+                .is_err()
+            );
+        }
     }
 }
